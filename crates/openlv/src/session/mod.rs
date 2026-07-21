@@ -19,15 +19,16 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    encryption::{DecryptionKey, EncryptionKey, HandshakeKey, KeyPair, PublicKeyHash, init_hash}, errors::OpenLvError, signaling::{
-        SignalState, SignalingLayer, SignalingProperties, SignalingProtocol,
-        create_signaling_channel, signaling_layer_from_version1,
-    }, transport::{
-        SessionMessage, TransportEvent, TransportLayer, TransportNegotiationMessage, TransportState,
-    }, url::{
-        SessionUri,
-        generate_session_id,
+    encryption::{DecryptionKey, EncryptionKey, HandshakeKey, KeyPair, PublicKeyHash, init_hash},
+    errors::OpenLvError,
+    signaling::{
+        PeerCapabilities, PeerInfo, SignalState, SignalingLayer, SignalingProperties,
+        SignalingProtocol, create_signaling_channel, signaling_layer_from_version1,
     },
+    transport::{
+        SessionMessage, TransportEvent, TransportLayer, TransportNegotiationMessage, TransportState,
+    },
+    url::{SessionUri, generate_session_id},
 };
 
 /// Default timeouts matching the JS implementation (10s ack, 1h response).
@@ -63,6 +64,8 @@ pub enum SessionState {
 pub struct SessionStateObject {
     pub status: SessionState,
     pub signaling: Option<SignalState>,
+    pub peer_info: Option<PeerInfo>,
+    pub error: Option<String>,
 }
 
 #[derive(Default)]
@@ -72,6 +75,7 @@ pub struct SessionInitParameters {
     pub k: Option<HandshakeKey>,
     pub p: Option<String>,
     pub s: Option<String>,
+    pub info: Option<PeerInfo>,
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +93,7 @@ pub struct SessionConfig {
     protocol: Option<SignalingProtocol>,
     server: Option<String>,
     handshake_key: Option<HandshakeKey>,
+    info: Option<PeerInfo>,
 }
 
 impl SessionConfig {
@@ -116,6 +121,12 @@ impl SessionConfig {
         self
     }
 
+    /// Set the identity shared with the remote peer during the handshake.
+    pub fn info(mut self, info: PeerInfo) -> Self {
+        self.info = Some(info);
+        self
+    }
+
     pub(crate) fn connect_url(mut self, url: String) -> Self {
         self.connect_url = Some(url);
         self
@@ -128,8 +139,12 @@ impl SessionConfig {
         Fut: Future<Output = Result<Value, OpenLvError>> + Send + 'static,
     {
         let handler = request_handler(handler);
+        if let Some(info) = &self.info {
+            info.validate()
+                .map_err(|reason| OpenLvError::Session(reason.into()))?;
+        }
         match self.connect_url {
-            Some(url) => connect_session(&url, handler).await,
+            Some(url) => connect_session_with_info(&url, handler, self.info).await,
             None => {
                 let protocol = self
                     .protocol
@@ -144,6 +159,7 @@ impl SessionConfig {
                         p: Some(protocol),
                         s: Some(server),
                         k: self.handshake_key,
+                        info: self.info,
                         ..Default::default()
                     },
                     handler,
@@ -184,6 +200,7 @@ struct SessionInner {
     signaling: SignalingLayer,
     transport: TransportLayer,
     relying_key: Arc<RwLock<Option<EncryptionKey>>>,
+    error: RwLock<Option<String>>,
     decryption_key: DecryptionKey,
     on_message: RequestHandler,
 }
@@ -212,6 +229,10 @@ pub async fn create_session(
             handshake_key: Some(handshake_key.clone()),
             encryption_key: key_pair.encryption_key.clone(),
             decryption_key: key_pair.decryption_key.clone(),
+            capabilities: PeerCapabilities {
+                transports: vec!["wrtc".to_string()],
+                info: init.info,
+            },
         },
     );
 
@@ -235,13 +256,29 @@ pub async fn connect_session(
     connection_url: &str,
     on_message: RequestHandler,
 ) -> Result<Session, OpenLvError> {
+    connect_session_with_info(connection_url, on_message, None).await
+}
+
+async fn connect_session_with_info(
+    connection_url: &str,
+    on_message: RequestHandler,
+    info: Option<PeerInfo>,
+) -> Result<Session, OpenLvError> {
     let uri = SessionUri::from_url(connection_url)?;
     let SessionUri::Version1(version1) = uri.clone();
 
     let key_pair = KeyPair::generate()?;
     let init_hash = init_hash(Some(&version1.key_hash.0), &key_pair.encryption_key)?;
 
-    let signaling = signaling_layer_from_version1(&version1, &key_pair, init_hash.is_host)?;
+    let signaling = signaling_layer_from_version1(
+        &version1,
+        &key_pair,
+        init_hash.is_host,
+        PeerCapabilities {
+            transports: vec!["wrtc".to_string()],
+            info,
+        },
+    )?;
 
     Ok(build_session(
         uri,
@@ -277,6 +314,7 @@ fn build_session(
             signaling,
             transport,
             relying_key,
+            error: RwLock::new(None),
             decryption_key,
             on_message,
         }),
@@ -329,6 +367,12 @@ impl Session {
         SessionStateObject {
             status: self.inner.status(),
             signaling: Some(self.inner.signaling.state()),
+            peer_info: self
+                .inner
+                .signaling
+                .peer_capabilities()
+                .and_then(|capabilities| capabilities.info),
+            error: self.inner.error(),
         }
     }
 
@@ -351,7 +395,11 @@ impl Session {
         match self.inner.status() {
             SessionState::Connected => return Ok(()),
             SessionState::Disconnected => {
-                return Err(OpenLvError::Session("session failed to connect".into()));
+                return Err(OpenLvError::Session(
+                    self.inner
+                        .error()
+                        .unwrap_or_else(|| "session failed to connect".into()),
+                ));
             }
             _ => {}
         }
@@ -368,8 +416,13 @@ impl Session {
                     return Ok(());
                 }
                 Ok(TransportState::Error) => {
+                    self.inner.set_error("peer-to-peer transport failed");
                     self.inner.set_status(SessionState::Disconnected);
-                    return Err(OpenLvError::Session("session failed to connect".into()));
+                    return Err(OpenLvError::Session(
+                        self.inner
+                            .error()
+                            .unwrap_or_else(|| "session failed to connect".into()),
+                    ));
                 }
                 Ok(_) => {
                     if self.inner.transport.state() == TransportState::Connected {
@@ -489,6 +542,25 @@ impl SessionInner {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    fn error(&self) -> Option<String> {
+        self.error
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set_error(&self, error: impl Into<String>) {
+        *self
+            .error
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.into());
+    }
+
+    fn select_transport(&self) -> Option<String> {
+        let peer = self.signaling.peer_capabilities()?;
+        select_transport_id(self.is_host, &["wrtc"], &peer.transports).map(str::to_string)
+    }
+
     fn set_status(&self, new_status: SessionState) {
         *self
             .status
@@ -497,6 +569,11 @@ impl SessionInner {
         let _ = self.state_tx.send(SessionStateObject {
             status: new_status,
             signaling: Some(self.signaling.state()),
+            peer_info: self
+                .signaling
+                .peer_capabilities()
+                .and_then(|capabilities| capabilities.info),
+            error: self.error(),
         });
     }
 
@@ -512,11 +589,21 @@ impl SessionInner {
                     self.set_status(SessionState::Linking);
                 }
                 SignalState::Encrypted => {
-                    if let Err(error) = self.transport.setup().await {
+                    if self.select_transport().is_none() {
+                        self.set_error("no common transport with peer");
+                        self.set_status(SessionState::Disconnected);
+                    } else if let Err(error) = self.transport.setup().await {
                         tracing::error!("transport setup failed: {error}");
+                        self.set_error(error.to_string());
+                        self.set_status(SessionState::Disconnected);
+                    } else {
+                        tokio::spawn(Arc::clone(&self).run_transport_state_loop());
                     }
                 }
-                SignalState::Error => self.set_status(SessionState::Disconnected),
+                SignalState::Error => {
+                    self.set_error("signaling failed or timed out");
+                    self.set_status(SessionState::Disconnected);
+                }
                 _ => {}
             }
         }
@@ -545,10 +632,25 @@ impl SessionInner {
                         }),
                 };
 
-            if let Some(negotiation) = negotiation {
-                if let Err(error) = self.transport.handle(negotiation).await {
-                    tracing::warn!("transport negotiation failed: {error}");
+            if let Some(negotiation) = negotiation
+                && let Err(error) = self.transport.handle(negotiation).await
+            {
+                tracing::warn!("transport negotiation failed: {error}");
+            }
+        }
+    }
+
+    async fn run_transport_state_loop(self: Arc<Self>) {
+        let mut state_rx = self.transport.subscribe_state();
+        while let Ok(state) = state_rx.recv().await {
+            match state {
+                TransportState::Connected => self.set_status(SessionState::Connected),
+                TransportState::Error => {
+                    self.set_error("peer-to-peer transport failed");
+                    self.set_status(SessionState::Disconnected);
+                    return;
                 }
+                _ => {}
             }
         }
     }
@@ -646,5 +748,51 @@ impl SessionInner {
         };
 
         self.transport.send(&encrypted).await
+    }
+}
+
+fn select_transport_id<'a>(
+    is_host: bool,
+    own_transports: &'a [&'a str],
+    peer_transports: &'a [String],
+) -> Option<&'a str> {
+    let host_preference: Vec<&str> = if is_host {
+        own_transports.to_vec()
+    } else {
+        peer_transports.iter().map(String::as_str).collect()
+    };
+    let client_supported: Vec<&str> = if is_host {
+        peer_transports.iter().map(String::as_str).collect()
+    } else {
+        own_transports.to_vec()
+    };
+    host_preference
+        .into_iter()
+        .find(|transport| client_supported.contains(transport))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_transport_id;
+
+    #[test]
+    fn selects_the_first_host_preference_supported_by_the_client() {
+        let host = ["ws", "wrtc"];
+        let client = vec!["wrtc".to_string(), "ws".to_string()];
+        assert_eq!(select_transport_id(true, &host, &client), Some("ws"));
+
+        let client_own = ["wrtc", "ws"];
+        let host_peer = vec!["ws".to_string(), "wrtc".to_string()];
+        assert_eq!(
+            select_transport_id(false, &client_own, &host_peer),
+            Some("ws")
+        );
+    }
+
+    #[test]
+    fn rejects_disjoint_transport_lists() {
+        let host = ["wrtc"];
+        let client = vec!["ws".to_string()];
+        assert_eq!(select_transport_id(true, &host, &client), None);
     }
 }

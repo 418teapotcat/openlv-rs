@@ -1,6 +1,6 @@
 [package]
 name = "openlv"
-version = "0.0.3"
+version = "0.1.0"
 edition = "2024"
 description = "a secure peer-to-peer wallet connectivity protocol"
 license = "GPL-3.0"
@@ -13,8 +13,7 @@ name = "openlv"
 path = "src/lib.rs"
 
 [features]
-default = ["alloy", "runtime-tokio"]
-alloy = []
+default = ["runtime-tokio"]
 runtime-tokio = ["webrtc/runtime-tokio"]
 runtime-smol = ["webrtc/runtime-smol"]
 
@@ -57,3 +56,6 @@ path = "../../examples/app/main.rs"
 
 [dev-dependencies]
 qrcode = { version = "0.14.1", default-features = false }
+alloy-primitives = "1"
+alloy-signer = "1"
+alloy-signer-local = { version = "1", features = ["mnemonic"] }

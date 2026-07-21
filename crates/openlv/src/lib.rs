@@ -14,16 +14,17 @@ pub mod utils;
 
 pub use errors::OpenLvError;
 pub use session::{
-    RequestHandler, Session, SessionConfig, SessionInitParameters, SessionState,
-    SessionStateObject, connect_session, create_session, dapp, request_handler, wallet,
+    RequestHandler, Session, SessionConfig, SessionState, SessionStateObject, connect_session,
+    create_session, dapp, request_handler, wallet,
 };
-pub use signaling::{SignalState, SignalingProtocol};
+pub use signaling::{PeerCapabilities, PeerInfo, SignalState, SignalingProtocol};
 pub use url::SessionUri;
 
 /// Convenient re-exports for the most common use cases.
 pub mod prelude {
     pub use crate::errors::OpenLvError;
     pub use crate::session::{Session, SessionConfig, SessionState, dapp, request_handler, wallet};
+    pub use crate::signaling::PeerInfo;
     pub use crate::signaling::SignalingProtocol as Protocol;
     pub use serde_json::json;
 }

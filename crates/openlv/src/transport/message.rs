@@ -2,14 +2,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Clone)]
-#[serde(tag = "type", rename_all = "camelCase")]
-pub enum TransportNegotiationMessage {
-    #[serde(rename = "offer")]
-    Offer { payload: String },
-    #[serde(rename = "answer")]
-    Answer { payload: String },
-    #[serde(rename = "candidate")]
-    Candidate { payload: String },
+pub struct TransportNegotiationMessage {
+    #[serde(rename = "type")]
+    pub message_type: String,
+    pub payload: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Clone)]

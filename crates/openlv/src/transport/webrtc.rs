@@ -3,9 +3,9 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::peer_connection::{
-    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
-    RTCIceServer, RTCPeerConnectionIceEvent, RTCPeerConnectionState, RTCSessionDescription,
-    MediaEngine, Registry, register_default_interceptors,
+    MediaEngine, PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
+    RTCConfigurationBuilder, RTCIceServer, RTCPeerConnectionIceEvent, RTCPeerConnectionState,
+    RTCSessionDescription, Registry, register_default_interceptors,
 };
 use webrtc::runtime::{Runtime, default_runtime};
 
@@ -40,9 +40,10 @@ impl PeerConnectionEventHandler for TransportHandler {
 
         let _ = self
             .event_tx
-            .send(TransportEvent::Negotiation(
-                TransportNegotiationMessage::Candidate { payload },
-            ))
+            .send(TransportEvent::Negotiation(TransportNegotiationMessage {
+                message_type: "candidate".into(),
+                payload,
+            }))
             .await;
     }
 
@@ -59,7 +60,10 @@ impl PeerConnectionEventHandler for TransportHandler {
     }
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
-        if state == RTCPeerConnectionState::Failed {
+        if matches!(
+            state,
+            RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
+        ) {
             set_state(&self.state, &self.state_tx, TransportState::Error);
         }
     }
@@ -72,6 +76,7 @@ pub struct TransportLayer {
     event_tx: mpsc::Sender<TransportEvent>,
     peer_connection: Mutex<Option<Arc<dyn PeerConnection>>>,
     data_channel: Arc<Mutex<Option<Arc<dyn DataChannel>>>>,
+    pending_candidates: Arc<Mutex<Vec<webrtc::peer_connection::RTCIceCandidateInit>>>,
 }
 
 impl TransportLayer {
@@ -87,6 +92,7 @@ impl TransportLayer {
                 event_tx: event_tx.clone(),
                 peer_connection: Mutex::new(None),
                 data_channel: Arc::new(Mutex::new(None)),
+                pending_candidates: Arc::new(Mutex::new(Vec::new())),
             },
             event_rx,
         )
@@ -116,8 +122,8 @@ impl TransportLayer {
             .map_err(transport_error)?;
 
         let registry = Registry::new();
-        let registry = register_default_interceptors(registry, &mut media_engine)
-            .map_err(transport_error)?;
+        let registry =
+            register_default_interceptors(registry, &mut media_engine).map_err(transport_error)?;
 
         let runtime =
             default_runtime().ok_or_else(|| OpenLvError::Transport("no async runtime".into()))?;
@@ -169,11 +175,10 @@ impl TransportLayer {
 
             let _ = self
                 .event_tx
-                .send(TransportEvent::Negotiation(
-                    TransportNegotiationMessage::Offer {
-                        payload: serde_json::to_string(&offer)?,
-                    },
-                ))
+                .send(TransportEvent::Negotiation(TransportNegotiationMessage {
+                    message_type: "offer".into(),
+                    payload: serde_json::to_string(&offer)?,
+                }))
                 .await;
         }
 
@@ -206,9 +211,7 @@ impl TransportLayer {
             .as_ref()
             .ok_or_else(|| OpenLvError::Transport("data channel not found".into()))?;
 
-        dc.send_text(payload)
-            .await
-            .map_err(transport_error)?;
+        dc.send_text(payload).await.map_err(transport_error)?;
 
         Ok(())
     }
@@ -220,11 +223,15 @@ impl TransportLayer {
             .ok_or_else(|| OpenLvError::Transport("peer connection not found".into()))?;
 
         match message {
-            TransportNegotiationMessage::Offer { payload } => {
+            TransportNegotiationMessage {
+                message_type,
+                payload,
+            } if message_type == "offer" => {
                 let offer: RTCSessionDescription = serde_json::from_str(&payload)?;
                 pc.set_remote_description(offer)
                     .await
                     .map_err(transport_error)?;
+                self.flush_pending_candidates(pc).await?;
 
                 let answer = pc.create_answer(None).await.map_err(transport_error)?;
 
@@ -234,32 +241,57 @@ impl TransportLayer {
 
                 let _ = self
                     .event_tx
-                    .send(TransportEvent::Negotiation(
-                        TransportNegotiationMessage::Answer {
-                            payload: serde_json::to_string(&answer)?,
-                        },
-                    ))
+                    .send(TransportEvent::Negotiation(TransportNegotiationMessage {
+                        message_type: "answer".into(),
+                        payload: serde_json::to_string(&answer)?,
+                    }))
                     .await;
             }
-            TransportNegotiationMessage::Answer { payload } => {
+            TransportNegotiationMessage {
+                message_type,
+                payload,
+            } if message_type == "answer" => {
                 let answer: RTCSessionDescription = serde_json::from_str(&payload)?;
                 pc.set_remote_description(answer)
                     .await
                     .map_err(transport_error)?;
+                self.flush_pending_candidates(pc).await?;
             }
-            TransportNegotiationMessage::Candidate { payload } => {
+            TransportNegotiationMessage {
+                message_type,
+                payload,
+            } if message_type == "candidate" => {
                 if payload.is_empty() {
                     return Ok(());
                 }
 
                 let candidate: webrtc::peer_connection::RTCIceCandidateInit =
                     serde_json::from_str(&payload)?;
+                if pc.remote_description().await.is_none() {
+                    self.pending_candidates.lock().await.push(candidate);
+                    return Ok(());
+                }
                 pc.add_ice_candidate(candidate)
                     .await
                     .map_err(transport_error)?;
             }
+            _ => {}
         }
 
+        Ok(())
+    }
+
+    async fn flush_pending_candidates(
+        &self,
+        peer_connection: &Arc<dyn PeerConnection>,
+    ) -> Result<(), OpenLvError> {
+        let candidates = std::mem::take(&mut *self.pending_candidates.lock().await);
+        for candidate in candidates {
+            peer_connection
+                .add_ice_candidate(candidate)
+                .await
+                .map_err(transport_error)?;
+        }
         Ok(())
     }
 
@@ -317,7 +349,10 @@ async fn store_and_poll_dc(
                         let _ = event_tx.send(TransportEvent::Message(text)).await;
                     }
                 }
-                DataChannelEvent::OnClose => break,
+                DataChannelEvent::OnClose => {
+                    set_state(&state, &state_tx, TransportState::Error);
+                    break;
+                }
                 _ => {}
             }
         }

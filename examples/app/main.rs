@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dapp.wait_for_link().await?;
     println!("Connected!");
 
-    let resp = dapp.send(json!({"test": "hello from dapp"})).await?;
+    let resp = dapp.send(json!({"method": "eth_chainId","params":[]})).await?;
     println!("Response: {resp}");
 
     dapp.close().await?;

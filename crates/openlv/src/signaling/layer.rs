@@ -3,14 +3,17 @@
 //! `Arc<SignalingInner>` so the channel receive callback and public API share
 //! the same state without duplicated plumbing.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 
 use serde_json::Value;
-use tokio::sync::{Mutex, broadcast};
+use tokio::{
+    sync::{Mutex, broadcast},
+    task::JoinHandle,
+};
 
 use super::{
     channel::SignalingChannel,
-    message::{PubkeyPayload, SignalingMessage},
+    message::{PeerCapabilities, PubkeyPayload, SignalingMessage},
     wire::{WirePrefix, WireRecipient, compose_frame, is_recipient, parse_frame},
 };
 use crate::{
@@ -38,6 +41,7 @@ pub struct SignalingProperties {
     pub handshake_key: Option<HandshakeKey>,
     pub encryption_key: EncryptionKey,
     pub decryption_key: DecryptionKey,
+    pub capabilities: PeerCapabilities,
 }
 
 pub struct SignalingLayer {
@@ -49,9 +53,12 @@ struct SignalingInner {
     properties: SignalingProperties,
     state: RwLock<SignalState>,
     relying_key: Arc<RwLock<Option<EncryptionKey>>>,
+    peer_capabilities: Arc<RwLock<Option<PeerCapabilities>>>,
     channel: Mutex<Box<dyn SignalingChannel>>,
     state_tx: broadcast::Sender<SignalState>,
     message_tx: broadcast::Sender<Value>,
+    handshake_task: StdMutex<Option<JoinHandle<()>>>,
+    deadline_task: StdMutex<Option<JoinHandle<()>>>,
 }
 
 impl SignalingLayer {
@@ -65,9 +72,12 @@ impl SignalingLayer {
                 properties,
                 state: RwLock::new(SignalState::Standby),
                 relying_key: Arc::new(RwLock::new(None)),
+                peer_capabilities: Arc::new(RwLock::new(None)),
                 channel: Mutex::new(channel),
                 state_tx,
                 message_tx,
+                handshake_task: StdMutex::new(None),
+                deadline_task: StdMutex::new(None),
             }),
         }
     }
@@ -91,6 +101,14 @@ impl SignalingLayer {
     /// Shared handle to the peer's public key, populated during the handshake.
     pub fn relying_key_handle(&self) -> Arc<RwLock<Option<EncryptionKey>>> {
         Arc::clone(&self.inner.relying_key)
+    }
+
+    pub fn peer_capabilities(&self) -> Option<PeerCapabilities> {
+        self.inner
+            .peer_capabilities
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub async fn setup(&self) -> Result<(), OpenLvError> {
@@ -120,8 +138,10 @@ impl SignalingLayer {
             inner.set_state(SignalState::Ready);
         } else {
             inner.set_state(SignalState::Ready);
+            inner.set_state(SignalState::Handshake);
+            inner.start_handshake_deadline();
             inner
-                .send_message(
+                .send_repeating(
                     WirePrefix::Handshake,
                     WireRecipient::Host,
                     SignalingMessage::Flash {
@@ -130,13 +150,13 @@ impl SignalingLayer {
                     },
                 )
                 .await?;
-            inner.set_state(SignalState::Handshake);
         }
 
         Ok(())
     }
 
     pub async fn teardown(&self) -> Result<(), OpenLvError> {
+        self.inner.stop_handshake_tasks();
         let mut channel = self.inner.channel.lock().await;
         channel.teardown().await
     }
@@ -177,6 +197,9 @@ impl SignalingInner {
             .state
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = new_state;
+        if matches!(new_state, SignalState::Encrypted | SignalState::Error) {
+            self.stop_handshake_tasks();
+        }
         let _ = self.state_tx.send(new_state);
     }
 
@@ -199,16 +222,93 @@ impl SignalingInner {
         SignalingMessage::Pubkey {
             payload: PubkeyPayload {
                 public_key: self.properties.encryption_key.to_string().to_string(),
-                d_app_info: None,
             },
             timestamp: current_timestamp(),
         }
     }
 
-    fn ack_message(&self) -> SignalingMessage {
-        SignalingMessage::Ack {
-            payload: None,
+    fn capabilities_message(&self) -> SignalingMessage {
+        SignalingMessage::Capabilities {
+            payload: self.properties.capabilities.clone(),
             timestamp: current_timestamp(),
+        }
+    }
+
+    fn start_handshake_deadline(self: &Arc<Self>) {
+        if self
+            .deadline_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+        {
+            return;
+        }
+
+        let inner = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+            if inner.state() != SignalState::Encrypted {
+                inner.set_state(SignalState::Error);
+            }
+        });
+        *self
+            .deadline_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(task);
+    }
+
+    async fn send_repeating(
+        self: &Arc<Self>,
+        prefix: WirePrefix,
+        recipient: WireRecipient,
+        message: SignalingMessage,
+    ) -> Result<(), OpenLvError> {
+        self.stop_repeating();
+        self.send_message(prefix, recipient, message.clone())
+            .await?;
+
+        let inner = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if inner
+                    .send_message(prefix, recipient, message.clone())
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!("failed to resend signaling handshake message");
+                }
+            }
+        });
+        *self
+            .handshake_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(task);
+        Ok(())
+    }
+
+    fn stop_repeating(&self) {
+        if let Some(task) = self
+            .handshake_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            task.abort();
+        }
+    }
+
+    fn stop_handshake_tasks(&self) {
+        self.stop_repeating();
+        if let Some(task) = self
+            .deadline_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            task.abort();
         }
     }
 
@@ -264,13 +364,18 @@ impl SignalingInner {
         };
 
         let message: SignalingMessage = serde_json::from_str(&plaintext)?;
+        if let Err(reason) = message.validate() {
+            tracing::debug!("dropping invalid signaling message: {reason}");
+            return Ok(());
+        }
         let is_host = self.properties.is_host;
 
         match (frame.prefix, &message, self.state(), is_host) {
             // Host receives the client's flash and replies with its pubkey.
             (WirePrefix::Handshake, SignalingMessage::Flash { .. }, SignalState::Ready, true) => {
                 self.set_state(SignalState::Handshake);
-                self.send_message(
+                self.start_handshake_deadline();
+                self.send_repeating(
                     WirePrefix::Handshake,
                     WireRecipient::Client,
                     self.pubkey_message(),
@@ -294,9 +399,11 @@ impl SignalingInner {
                     return Ok(());
                 }
 
-                self.store_relying_key(received_key);
+                if !self.store_relying_key(received_key) {
+                    return Ok(());
+                }
                 self.set_state(SignalState::HandshakePartial);
-                self.send_message(
+                self.send_repeating(
                     WirePrefix::Encrypted,
                     WireRecipient::Host,
                     self.pubkey_message(),
@@ -304,8 +411,7 @@ impl SignalingInner {
                 .await?;
             }
 
-            // Host records the client pubkey, sends ack, and enters encrypted
-            // mode (matching JS behaviour where no ack echo is required).
+            // Host records the client pubkey, then advertises its capabilities.
             (
                 WirePrefix::Encrypted,
                 SignalingMessage::Pubkey { payload, .. },
@@ -314,39 +420,53 @@ impl SignalingInner {
             ) => {
                 let received_key = parse_encryption_key(&payload.public_key)?;
 
-                self.store_relying_key(received_key);
-                self.send_message(
+                if !self.store_relying_key(received_key) {
+                    return Ok(());
+                }
+                self.set_state(SignalState::HandshakePartial);
+                self.send_repeating(
                     WirePrefix::Encrypted,
                     WireRecipient::Client,
-                    self.ack_message(),
+                    self.capabilities_message(),
                 )
                 .await?;
-                self.set_state(SignalState::Encrypted);
             }
 
-            // Both sides enter encrypted mode on ack; the client echoes a
-            // final ack back to the host for robustness.
+            // Both sides enter encrypted mode on capabilities; the client echoes
+            // its own capabilities to complete the host's handshake.
             (
                 WirePrefix::Encrypted,
-                SignalingMessage::Ack { .. },
+                SignalingMessage::Capabilities { payload, .. },
                 SignalState::HandshakePartial,
                 _,
             ) => {
+                self.store_peer_capabilities(payload.clone());
                 self.set_state(SignalState::Encrypted);
 
                 if !is_host {
                     self.send_message(
                         WirePrefix::Encrypted,
                         WireRecipient::Host,
-                        self.ack_message(),
+                        self.capabilities_message(),
                     )
                     .await?;
                 }
             }
 
-            // Ignore ack echoes when already encrypted (harmless race).
-            (WirePrefix::Encrypted, SignalingMessage::Ack { .. }, SignalState::Encrypted, _) => {
-                // already encrypted, ack echo is redundant
+            // If the host's capabilities are retried after the client entered
+            // encrypted mode, the client's final packet was lost.
+            (
+                WirePrefix::Encrypted,
+                SignalingMessage::Capabilities { .. },
+                SignalState::Encrypted,
+                false,
+            ) => {
+                self.send_message(
+                    WirePrefix::Encrypted,
+                    WireRecipient::Host,
+                    self.capabilities_message(),
+                )
+                .await?;
             }
 
             (
@@ -366,11 +486,26 @@ impl SignalingInner {
         Ok(())
     }
 
-    fn store_relying_key(&self, key: EncryptionKey) {
-        *self
+    fn store_relying_key(&self, key: EncryptionKey) -> bool {
+        let mut relying_key = self
             .relying_key
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(key);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if relying_key.is_some() {
+            return false;
+        }
+        *relying_key = Some(key);
+        true
+    }
+
+    fn store_peer_capabilities(&self, capabilities: PeerCapabilities) {
+        let mut peer_capabilities = self
+            .peer_capabilities
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if peer_capabilities.is_none() {
+            *peer_capabilities = Some(capabilities);
+        }
     }
 }
 
@@ -379,4 +514,134 @@ fn current_timestamp() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::encryption::{KeyPair, init_hash};
+    use crate::signaling::channel::MessageHandler;
+
+    struct MemoryChannel {
+        handlers: Arc<Mutex<Vec<MessageHandler>>>,
+    }
+
+    #[async_trait]
+    impl SignalingChannel for MemoryChannel {
+        fn channel_type(&self) -> &'static str {
+            "memory"
+        }
+
+        async fn setup(&mut self) -> Result<(), OpenLvError> {
+            Ok(())
+        }
+
+        async fn teardown(&mut self) -> Result<(), OpenLvError> {
+            Ok(())
+        }
+
+        async fn publish(&self, payload: &str) -> Result<(), OpenLvError> {
+            let handlers = self
+                .handlers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for handler in handlers.iter() {
+                handler(payload.to_string());
+            }
+            Ok(())
+        }
+
+        async fn subscribe(&mut self, handler: MessageHandler) -> Result<(), OpenLvError> {
+            self.handlers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(handler);
+            Ok(())
+        }
+    }
+
+    fn properties(
+        is_host: bool,
+        hash: String,
+        key_pair: &KeyPair,
+        handshake_key: HandshakeKey,
+        identity: &str,
+    ) -> SignalingProperties {
+        SignalingProperties {
+            is_host,
+            h: hash,
+            handshake_key: Some(handshake_key),
+            encryption_key: key_pair.encryption_key.clone(),
+            decryption_key: key_pair.decryption_key.clone(),
+            capabilities: PeerCapabilities {
+                transports: vec!["wrtc".into()],
+                info: Some(crate::signaling::message::PeerInfo {
+                    identity: identity.into(),
+                    name: identity.into(),
+                    icon: None,
+                }),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn exchanges_capabilities_before_entering_encrypted_state() {
+        let handlers = Arc::new(Mutex::new(Vec::new()));
+        let host_key_pair = KeyPair::generate().unwrap();
+        let client_key_pair = KeyPair::generate().unwrap();
+        let hash = init_hash(None, &host_key_pair.encryption_key).unwrap().hash;
+        let handshake_key = HandshakeKey::generate().unwrap();
+
+        let host = SignalingLayer::new(
+            Box::new(MemoryChannel {
+                handlers: Arc::clone(&handlers),
+            }),
+            properties(
+                true,
+                hash.clone(),
+                &host_key_pair,
+                handshake_key.clone(),
+                "com.example.dapp",
+            ),
+        );
+        let client = SignalingLayer::new(
+            Box::new(MemoryChannel { handlers }),
+            properties(
+                false,
+                hash,
+                &client_key_pair,
+                handshake_key,
+                "com.example.wallet",
+            ),
+        );
+
+        host.setup().await.unwrap();
+        client.setup().await.unwrap();
+
+        tokio::time::timeout(tokio::time::Duration::from_secs(1), async {
+            loop {
+                if host.state() == SignalState::Encrypted
+                    && client.state() == SignalState::Encrypted
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            host.peer_capabilities().unwrap().info.unwrap().identity,
+            "com.example.wallet"
+        );
+        assert_eq!(
+            client.peer_capabilities().unwrap().info.unwrap().identity,
+            "com.example.dapp"
+        );
+    }
 }

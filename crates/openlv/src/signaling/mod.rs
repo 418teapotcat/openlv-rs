@@ -9,7 +9,7 @@ use std::fmt::Display;
 
 pub use channel::SignalingChannel;
 pub use layer::{SignalState, SignalingLayer, SignalingProperties};
-pub use message::SignalingMessage;
+pub use message::{PeerCapabilities, PeerInfo, SignalingMessage};
 
 use crate::{encryption::KeyPair, errors::OpenLvError, url::v1::Version1SessionUri};
 
@@ -70,6 +70,7 @@ pub fn signaling_layer_from_version1(
     version1: &Version1SessionUri,
     key_pair: &KeyPair,
     is_host: bool,
+    capabilities: PeerCapabilities,
 ) -> Result<SignalingLayer, OpenLvError> {
     let channel = create_signaling_channel(
         &version1.signaling_protocol,
@@ -82,6 +83,7 @@ pub fn signaling_layer_from_version1(
         handshake_key: Some(version1.shared_key.clone()),
         encryption_key: key_pair.encryption_key.clone(),
         decryption_key: key_pair.decryption_key.clone(),
+        capabilities,
     };
 
     Ok(SignalingLayer::new(channel, properties))

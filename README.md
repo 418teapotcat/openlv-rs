@@ -32,7 +32,7 @@
 
 ```bash
 [dependencies]
-openlv = "0.0.2"
+openlv = "0.1.0"
 ```
 
 ## Overview
