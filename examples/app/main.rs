@@ -1,7 +1,7 @@
 //! dApp (host) example for the openlv library.
 //!
-//! Creates a session, waits for a wallet to connect, sends a test request,
-//! and prints the response.
+//! Creates a session, waits for a wallet to connect, sends an EIP-1193
+//! request, and prints the response.
 //!
 //! Usage:
 //!   cargo run --example dapp
@@ -11,32 +11,33 @@ use qrcode::QrCode;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dapp = openlv::dapp()
+    let provider = openlv::dapp()
         .protocol(Protocol::Ntfy)
         .server("https://ntfy.sh/")
-        .on_request(|msg| async move {
-            println!("[dapp] received request: {msg}");
-            Ok(json!({"result": "ok"}))
-        })
+        .provider()
         .await?;
 
-    dapp.connect().await?;
+    provider.connect().await?;
 
-    let uri = dapp.uri().to_string();
+    let uri = provider.uri().to_string();
 
     println!("Connection URL: {}", uri);
 
     let qr = QrCode::new(uri)?;
-    let qr_data = qr.render::<char>().quiet_zone(false).module_dimensions(2, 1).build();
+    let qr_data = qr
+        .render::<char>()
+        .quiet_zone(false)
+        .module_dimensions(2, 1)
+        .build();
     println!("QR Code:\n{}", qr_data);
 
     println!("Waiting for wallet to connect...");
-    dapp.wait_for_link().await?;
+    provider.wait_for_link().await?;
     println!("Connected!");
 
-    let resp = dapp.send(json!({"method": "eth_chainId","params":[]})).await?;
-    println!("Response: {resp}");
+    let chain_id = provider.request("eth_chainId", json!([])).await?;
+    println!("Chain ID: {chain_id}");
 
-    dapp.close().await?;
+    provider.close().await?;
     Ok(())
 }

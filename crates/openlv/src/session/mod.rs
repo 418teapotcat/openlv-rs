@@ -21,6 +21,7 @@ use uuid::Uuid;
 use crate::{
     encryption::{DecryptionKey, EncryptionKey, HandshakeKey, KeyPair, PublicKeyHash, init_hash},
     errors::OpenLvError,
+    provider::Provider,
     signaling::{
         PeerCapabilities, PeerInfo, SignalState, SignalingLayer, SignalingProperties,
         SignalingProtocol, create_signaling_channel, signaling_layer_from_version1,
@@ -132,13 +133,36 @@ impl SessionConfig {
         self
     }
 
-    /// Finalize the session with an incoming-request handler.
+    /// Finalize a wallet session with an incoming EIP-1193 request handler.
     pub async fn on_request<F, Fut>(self, handler: F) -> Result<Session, OpenLvError>
     where
         F: Fn(Value) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Value, OpenLvError>> + Send + 'static,
     {
-        let handler = request_handler(handler);
+        self.build(request_handler(handler)).await
+    }
+
+    /// Finalize a dApp session as an EIP-1193 provider.
+    pub async fn provider(self) -> Result<Provider, OpenLvError> {
+        let session = self
+            .build(request_handler(|request| async move {
+                let method = request
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<missing method>");
+                Ok(serde_json::json!({
+                    "error": {
+                        "code": -32601,
+                        "message": format!("Method {method} not found"),
+                    }
+                }))
+            }))
+            .await?;
+
+        Ok(Provider::new(session))
+    }
+
+    async fn build(self, handler: RequestHandler) -> Result<Session, OpenLvError> {
         if let Some(info) = &self.info {
             info.validate()
                 .map_err(|reason| OpenLvError::Session(reason.into()))?;
@@ -719,17 +743,24 @@ impl SessionInner {
 
         let _ = self.request_tx.send(payload.clone());
 
-        match (self.on_message)(payload).await {
-            Ok(result) => {
-                let response = SessionMessage::Response {
-                    message_id,
-                    payload: result,
-                };
-                if let Err(error) = self.send_session_message(&response).await {
-                    tracing::warn!("failed to send response: {error}");
-                }
+        let payload = match (self.on_message)(payload).await {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!("request handler failed: {error}");
+                serde_json::json!({
+                    "error": {
+                        "code": -32603,
+                        "message": "Internal error",
+                    }
+                })
             }
-            Err(error) => tracing::warn!("request handler failed: {error}"),
+        };
+        let response = SessionMessage::Response {
+            message_id,
+            payload,
+        };
+        if let Err(error) = self.send_session_message(&response).await {
+            tracing::warn!("failed to send response: {error}");
         }
     }
 

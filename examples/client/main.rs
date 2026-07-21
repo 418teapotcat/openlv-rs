@@ -12,7 +12,6 @@ use alloy_signer::SignerSync;
 use alloy_signer_local::{MnemonicBuilder, PrivateKeySigner, coins_bip39::English};
 use openlv::prelude::*;
 use serde_json::Value;
-use tokio::sync::broadcast;
 
 const ANVIL_MNEMONIC: &str = "test test test test test test test test test test test junk";
 
@@ -104,7 +103,7 @@ async fn main() {
         .on_request(move |msg| {
             let signer = signer.clone();
             async move {
-                println!("Received request: {msg}");
+                println!("Received EIP-1193 request: {msg}");
                 Ok(handle_rpc_request(msg, &signer))
             }
         })
@@ -125,33 +124,9 @@ async fn main() {
     });
 
     println!("Connected!");
+    println!("Listening for EIP-1193 requests. Press Ctrl+C to exit.");
 
-    let mut requests = wallet.subscribe_requests();
-
-    loop {
-        tokio::select! {
-            msg = requests.recv() => {
-                match msg {
-                    Ok(payload) => {
-                        println!("Incoming request: {payload}");
-                        // TODO: respond
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        eprintln!("Warning: missed some requests");
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        eprintln!("Request channel closed, exiting.");
-                        break;
-                    }
-                }
-            }
-            _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {
-                // keep alive
-            }
-        }
-    }
-
-    let _ = wallet.close().await;
+    std::future::pending::<()>().await;
 }
 
 #[cfg(test)]

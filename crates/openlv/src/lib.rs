@@ -6,6 +6,7 @@ It allows for establishing a secure connection between a dApp and a wallet lever
 
 pub mod encryption;
 pub mod errors;
+pub mod provider;
 pub mod session;
 pub mod signaling;
 pub mod transport;
@@ -13,6 +14,7 @@ pub mod url;
 pub mod utils;
 
 pub use errors::OpenLvError;
+pub use provider::Provider;
 pub use session::{
     RequestHandler, Session, SessionConfig, SessionState, SessionStateObject, connect_session,
     create_session, dapp, request_handler, wallet,
@@ -23,6 +25,7 @@ pub use url::SessionUri;
 /// Convenient re-exports for the most common use cases.
 pub mod prelude {
     pub use crate::errors::OpenLvError;
+    pub use crate::provider::Provider;
     pub use crate::session::{Session, SessionConfig, SessionState, dapp, request_handler, wallet};
     pub use crate::signaling::PeerInfo;
     pub use crate::signaling::SignalingProtocol as Protocol;

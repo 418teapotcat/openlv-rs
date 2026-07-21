@@ -1,3 +1,4 @@
+use serde_json::Value;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -31,6 +32,13 @@ pub enum OpenLvError {
 
     #[error("request timed out: {0}")]
     RequestTimeout(String),
+
+    #[error("EIP-1193 provider error {code}: {message}")]
+    Provider {
+        code: i64,
+        message: String,
+        data: Option<Value>,
+    },
 
     #[error("{0}")]
     Other(String),
