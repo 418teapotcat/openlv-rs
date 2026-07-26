@@ -2,6 +2,58 @@
 Open Lavatory (openlv for short) is a secure peer-to-peer wallet connectivity protocol.
 
 It allows for establishing a secure connection between a dApp and a wallet leveraging public infrastructure, p2p, and encryption.
+
+# Usage
+
+## dApp (host)
+
+```rust
+use openlv::prelude::*;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let dapp = openlv::dapp()
+        .protocol(Protocol::Ntfy)
+        .server("https://ntfy.sh/")
+        .on_request(|msg| async move {
+            println!("received: {msg}");
+            Ok(json!({"result": "ok"}))
+        })
+        .await?;
+
+    dapp.connect().await?;
+    println!("Connection URL: {}", dapp.uri());
+    dapp.wait_for_link().await?;
+
+    let resp = dapp.send(json!({"method": "eth_chainId", "params": []})).await?;
+    println!("Response: {resp}");
+
+    dapp.close().await?;
+    Ok(())
+}
+```
+
+## Wallet (client)
+
+```rust
+use openlv::prelude::*;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let wallet = openlv::wallet("openlv://...")
+        .on_request(|msg| async move {
+            Ok(json!({"result": "ok"}))
+        })
+        .await?;
+
+    wallet.connect().await?;
+    wallet.wait_for_link().await?;
+    println!("Connected!");
+
+    wallet.close().await?;
+    Ok(())
+}
+```
 */
 
 pub mod encryption;
