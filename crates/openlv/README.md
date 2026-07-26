@@ -19,25 +19,24 @@ Native Rust implementation of the [Open Lavatory](https://openlv.sh) protocol fo
 ## Usage
 
 ```rust
-use openlv::{create_session, SessionInitParameters};
-use serde_json::json;
-use std::sync::Arc;
+use openlv::prelude::*;
 
 #[tokio::main]
-async fn main() -> Result<(), openlv::OpenLvError> {
-    let session = create_session(
-        SessionInitParameters {
-            session_id: Some("mytestsession111".into()),
-            p: Some("ntfy".into()),
-            s: Some("https://ntfy.sh/".into()),
-            ..Default::default()
-        },
-        Arc::new(|_msg| Ok(json!({"result": "success"}))),
-    )
-    .await?;
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let dapp = openlv::dapp()
+        .protocol(Protocol::Ntfy)
+        .server("https://ntfy.sh/")
+        .on_request(|msg| async move {
+            println!("received: {msg}");
+            Ok(json!({"result": "ok"}))
+        })
+        .await?;
 
-    session.connect().await?;
-    println!("{}", session.connection_url());
+    dapp.connect().await?;
+    println!("Connection URL: {}", dapp.uri());
+    dapp.wait_for_link().await?;
+
+    dapp.close().await?;
     Ok(())
 }
 ```
