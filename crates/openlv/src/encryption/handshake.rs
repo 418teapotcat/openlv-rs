@@ -23,9 +23,9 @@ impl std::fmt::Debug for HandshakeKey {
     }
 }
 
-impl ToString for HandshakeKey {
-    fn to_string(&self) -> String {
-        self.hex.to_string()
+impl std::fmt::Display for HandshakeKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.hex)
     }
 }
 
