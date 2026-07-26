@@ -237,6 +237,7 @@ pub async fn create_session(
     );
 
     let uri = SessionUri::new(
+        &session_id,
         PublicKeyHash::from(&key_pair.encryption_key),
         handshake_key,
         protocol,

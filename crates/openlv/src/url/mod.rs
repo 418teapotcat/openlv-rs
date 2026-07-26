@@ -30,13 +30,14 @@ pub fn generate_session_id() -> String {
 
 impl SessionUri {
     pub fn new(
+        session_id: &str,
         key_hash: PublicKeyHash,
         shared_key: HandshakeKey,
         signaling_protocol: SignalingProtocol,
         signaling_server: String,
     ) -> Self {
         Self::Version1(Version1SessionUri {
-            session_id: generate_session_id(),
+            session_id: session_id.to_string(),
             key_hash,
             shared_key,
             signaling_protocol,
