@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
@@ -87,11 +88,12 @@ impl SignalingChannel for NtfyChannel {
                                                     .and_then(|attachment| attachment.get("url"))
                                                     .and_then(|url| url.as_str())
                                                 {
-                                                    Some(url) => match attachment_client.get(url).send().await {
-                                                        Ok(response) => match response.text().await {
+                                                    Some(url) => match tokio::time::timeout(Duration::from_secs(5), attachment_client.get(url).send()).await {
+                                                        Ok(Ok(response)) => match response.text().await {
                                                             Ok(text) => text,
                                                             Err(_) => continue,
                                                         },
+                                                        Ok(Err(_)) => continue,
                                                         Err(_) => continue,
                                                     },
                                                     None => body.to_owned(),
