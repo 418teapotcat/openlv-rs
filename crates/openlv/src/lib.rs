@@ -7,7 +7,7 @@ It allows for establishing a secure connection between a dApp and a wallet lever
 
 ## dApp (host)
 
-```rust
+```rust,ignore
 use openlv::prelude::*;
 
 #[tokio::main]
@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Wallet (client)
 
-```rust
+```rust,ignore
 use openlv::prelude::*;
 
 #[tokio::main]
