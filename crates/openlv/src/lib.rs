@@ -65,6 +65,7 @@ pub mod signaling;
 pub mod transport;
 pub mod url;
 pub mod utils;
+pub mod provider;
 
 pub use errors::OpenLvError;
 pub use session::{
