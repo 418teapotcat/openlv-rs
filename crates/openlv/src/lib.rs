@@ -52,6 +52,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     wallet.close().await?;
     Ok(())
+}
+```
+*/
+
 pub mod encryption;
 pub mod errors;
 pub mod provider;
