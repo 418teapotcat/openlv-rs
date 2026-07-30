@@ -19,7 +19,7 @@ runtime-tokio = ["webrtc/runtime-tokio"]
 runtime-smol = ["webrtc/runtime-smol"]
 
 [dependencies]
-alloy = { version = "1.8", features = ["json-rpc"], optional = true }
+alloy = { version = "2", features = ["json-rpc"], optional = true }
 tower = { version = "0.5", optional = true }
 aes-gcm = "0.10"
 async-trait = "0.1"
@@ -40,7 +40,7 @@ thiserror = "2"
 tracing = "0.1"
 
 mqtt5 = "0.32"
-webrtc = "0.20.0-alpha.2"
+webrtc = "0.20.0"
 
 # todo: support for rustls-tls vs others via feature flags?
 reqwest = { version = "0.12", default-features = false, features = [
@@ -68,5 +68,5 @@ path = "../../examples/app/main.rs"
 [dev-dependencies]
 qrcode = { version = "0.14.1", default-features = false }
 alloy-primitives = "1"
-alloy-signer = "1"
-alloy-signer-local = { version = "1", features = ["mnemonic"] }
+alloy-signer = "2"
+alloy-signer-local = { version = "2", features = ["mnemonic"] }
