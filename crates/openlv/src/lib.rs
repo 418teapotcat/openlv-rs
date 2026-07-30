@@ -58,11 +58,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 pub mod encryption;
 pub mod errors;
-pub mod provider;
 pub mod session;
 pub mod signaling;
 pub mod transport;
 pub mod url;
+pub mod utils;
+#[cfg(feature = "provider")]
+pub mod provider;
 
 pub use errors::OpenLvError;
 pub use session::{
